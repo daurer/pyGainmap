@@ -1,0 +1,221 @@
+#!/usr/bin/env python
+"""
+A script generating a gain map based on pixelwise histograms from either fluorescence or sample data.
+
+Author:       Benedikt J. Daurer (benedikt@xray.bmc.uu.se)
+Last change:  March 9, 2014
+"""
+# --------------
+# IMPORT MODULES
+# ----------------
+import numpy as np
+import scipy as sp
+import h5py, os, sys, time, argparse, logging
+from fastloop import FastLoop
+from fitting import fit_photon_histograms
+from plotting import show_histogram, show_five_histograms, show
+# ---------------------------------------
+
+
+def fitting_mode(args):
+
+    # -------------------------
+    # LOAD HISTOGRAMSs and MASK
+    # -----------------------------------------
+    histfile = h5py.File(args.histfilename, 'r')
+    Hmap = histfile['data/histogram']
+    Hbinsize = histfile['data/histogramBinsize'][0]
+    Hcount = histfile['data/histogramCount'][0]
+    Hmin = histfile['data/histogramMin'][0]
+    Hnbins = histfile['data/histogramNbins'][0]
+    Hbins = np.linspace(Hmin, Hnbins + Hmin - 1, Hnbins)
+    NY = Hmap.shape[0]
+    NX = Hmap.shape[1]
+    SH = (NY, NX)
+    NXY = NX * NY
+    if args.m is None: mask = np.zeros(SH).astype(np.bool)
+    else:
+        maskfile = h5py.File(args.m, 'r')
+        mask = (1 - maskfile['data/data'][:]).astype(np.bool)
+        maskfile.close()
+
+    # ----------------------------
+    # TEMPORARLY STORE FLAT ARRAYS
+    # -----------------------------------------
+    infile = h5py.File(args.t + '/tmpin.h5', 'w')
+    infile['histogram'] = Hmap[:].reshape(NXY, Hnbins)
+    infile['mask'] = mask.flat
+    infile.close()
+    histfile.close()
+
+    # ---------------------------------------------
+    # INITIALIZE TEMPORARY FILE FOR FITTING RESULTS
+    # ---------------------------------------------
+    outfile = h5py.File(args.t + '/tmpout.h5', 'w')
+    for key in ['bg_offset', 'bg_amp', 'bg_sigma', 'photon_offset', 'photon_amp', 'photon_sigma']:
+        dset = outfile.create_dataset(key, (NXY,))
+        dset.attrs['shape'] = SH
+    dset = outfile.create_dataset('status', (NXY,), dtype=h5py.special_dtype(vlen=str))
+    dset.attrs['shape'] = SH
+    outfile.close()
+
+    # ----------------------
+    # PRINT SOME INFORMATION
+    # ---------------------------
+    start_time = time.localtime()
+    timestamp = str(start_time.tm_year) + '%02d' %start_time.tm_mon + '%02d' %start_time.tm_mday + '_' + '%02d' %start_time.tm_hour + '%02d' %start_time.tm_min
+    print 'Running a fitting analysis on pixel histograms, started at: ', time.strftime("%a, %d %b %Y %H:%M:%S", start_time)
+    print 'Detector shape: ', SH
+    print 'Histogram details: %d bins between %d and %d ADUs' %(Hnbins, Hmin, Hmin + Hnbins)
+    print 'Nr. of bad pixels: %d/%d = %.2f %%' % (mask.sum(), NXY, float(mask.sum()) / NXY * 100.)
+
+    # ---------------
+    # START FAST LOOP
+    # ---------------------------
+    infile = args.t + '/tmpin.h5'
+    outfile = args.t + '/tmpout.h5'
+    fastloop = FastLoop(infile, outfile, args.c, NXY, fit_photon_histograms, Hbins)
+    fastloop.start()
+    fastloop.write()
+    os.remove(args.t + '/tmpin.h5')
+    os.system('cp ' + args.t + '/tmpout.h5 ' +  args.o + '/fitting_results_%s.h5' %timestamp)
+    os.remove(args.t + '/tmpout.h5')
+    print 'Running a fitting analysis on pixel histograms, finished at: ', time.strftime("%a, %d %b %Y %H:%M:%S", time.localtime())
+
+
+def generating_mode(args):
+
+    # -----------------------------
+    # LOAD FITTING RESULTS AND MASK
+    # ----------------------------------------
+    fitfile = h5py.File(args.fitfilename, 'r')
+    bg_offset = fitfile['bg_offset'][:].reshape(tuple(fitfile['bg_offset'].attrs['shape']))
+    bg_amp = fitfile['bg_amp'][:].reshape(tuple(fitfile['bg_amp'].attrs['shape']))
+    bg_sigma = fitfile['bg_sigma'][:].reshape(tuple(fitfile['bg_sigma'].attrs['shape']))
+    photon_offset = fitfile['photon_offset'][:].reshape(tuple(fitfile['photon_offset'].attrs['shape']))
+    photon_amp = fitfile['photon_amp'][:].reshape(tuple(fitfile['photon_amp'].attrs['shape']))
+    photon_sigma = fitfile['photon_sigma'][:].reshape(tuple(fitfile['photon_sigma'].attrs['shape']))
+    status = fitfile['status'][:].reshape(tuple(fitfile['status'].attrs['shape']))
+    gain = photon_offset - bg_offset
+    SH = status.shape
+    NXY = SH[0] * SH[1]
+    if args.m is None: mask = np.zeros(SH).astype(np.bool)
+    else:
+        maskfile = h5py.File(args.m, 'r')
+        mask = (1 - maskfile['data/data'][:]).astype(np.bool)
+        maskfile.close()
+
+    # ----------------------
+    # PRINT SOME INFORMATION
+    # ------------------------------------------
+    mask_bad_pixel = (status == 'is_bad') | mask
+    mask_error = (status == 'fit_error') | (status == 'hist_error') | (status == 'other_error')
+    mask_ok = (status == 'ok')
+    print 'Nr. of bad pixels: %d/%d = %.2f %%' % (mask_bad_pixel.sum(), NXY, float(mask_bad_pixel.sum()) / NXY * 100.) 
+    print 'Nr. of pixels with errors: %d/%d = %.2f %%' % (mask_error.sum(), NXY, float(mask_error.sum()) / NXY * 100.) 
+    print 'Nr. of pixels to be used (bad and error excluded): %d/%d = %.2f %%' % (mask_ok.sum(), NXY, float(mask_ok.sum()) / NXY * 100.) 
+    mask = mask_bad_pixel | mask_error
+
+    # ------------------------------------------------------------
+    # CHECK FOR PIXELS WITH TOO WEAK/STRONG PHOTON PEAK AMPLITUDES
+    # ------------------------------------------------------------
+    if args.pa is not None: 
+        mask |= (photon_amp < args.pa[0]) | (photon_amp > args.pa[1])
+        print 'Nr. of pixels to be used (%.2f < photon amp < %.2f): %d/%d = %.2f %%' % (args.pa[0], args.pa[1], (~mask).sum(), NXY, float((~mask).sum()) / NXY * 100.)
+
+    # ------------------------------------------------------
+    # CHECK FOR PIXELS WITH UNREASONABLE PHOTON SIGMA VALUES
+    # ------------------------------------------------------
+    if args.ps is not None: 
+        mask |= (photon_sigma < args.ps[0]) | (photon_sigma > args.ps[1])
+        print 'Nr. of pixels to be used (%.2f < photon sigma < %.2f): %d/%d = %.2f %%' % (args.ps[0], args.ps[1], (~mask).sum(), NXY, float((~mask).sum()) / NXY * 100.)
+
+    # ----------------------------------------------------------------
+    # CHECK FOR PIXELS WITH TOO STRONG/WEAK BACKGROUND PEAK AMPLITUDES
+    # ----------------------------------------------------------------
+    if args.ba is not None: 
+        mask |= (bg_amp < args.ba[0]) | (bg_amp > args.ba[1])
+        print 'Nr. of pixels to be used (%.2f < bg amp < %.2f): %d/%d = %.2f %%' % (args.ba[0], args.ba[1], (~mask).sum(), NXY, float((~mask).sum()) / NXY * 100.)
+
+    # ----------------------------------------------------------
+    # CHECK FOR PIXELS WITH UNREASONABLE BACKGROUND SIGMA VALUES
+    # ----------------------------------------------------------
+    if args.bs is not None: 
+        mask |= (bg_sigma < args.bs[0]) | (bg_sigma > args.bs[1])
+        print 'Nr. of pixels to be used (%.2f < bg sigma < %.2f): %d/%d = %.2f %%' % (args.bs[0], args.bs[1], (~mask).sum(), NXY, float((~mask).sum()) / NXY * 100.)
+
+    # ----------------------------------------------
+    # CHECK FOR PIXELS WITH UNREASONABLE GAIN VALUES
+    # ----------------------------------------------
+    if args.g is not None: 
+        mask |= (gain < args.g[0]) | (gain > args.g[1])
+        print 'Nr. of pixels to be used (%.2f < gain < %.2f): %d/%d = %.2f %%' % (args.g[0], args.g[1], (~mask).sum(), NXY, float((~mask).sum()) / NXY * 100.)
+
+    # -------------------------------------
+    # SHOW HISTOGRAMS OF FITTING PARAMETERS
+    # -------------------------------------
+    if args.s: 
+        params = [photon_amp[~mask], photon_sigma[~mask], bg_amp[~mask],bg_sigma[~mask], gain[~mask]]
+        titles = ['Histogram of %s values' %p for p in ['photon amp', 'photon sigma', 'bg amp', 'bg sigma', 'gain']]
+        show_five_histograms(params, titles, bins=args.b)
+        show()
+
+    # apply mask
+    gain[mask] = np.nan
+    bg_sigma[mask] = np.nan
+
+    # ----------------------------
+    # SAVE GAIN MAP AND OTHER MAPS
+    # ---------------------------------------------------
+    gainfile = h5py.File(args.o + 'fitting_gain.h5', 'w')
+    gainfile['data/data'] = gain
+    gainfile.close()
+    bgsigmafile = h5py.File(args.o + 'fitting_bgsigma.h5', 'w')
+    bgsigmafile['data/data'] = bg_sigma
+    bgsigmafile.close()
+    gainmaskfile = h5py.File(args.o + 'fitting_mask.h5', 'w')
+    gainmaskfile['data/data'] = mask
+    if args.pa is not None: gainmaskfile['data/limits/photon_amp'] = args.pa
+    if args.ps is not None: gainmaskfile['data/limits/photon_sigma'] = args.ps
+    if args.ba is not None: gainmaskfile['data/limits/bg_amp'] = args.ba
+    if args.bs is not None: gainmaskfile['data/limits/bg_sigma'] = args.bs
+    if args.g is not None: gainmaskfile['data/limits/gain'] = args.g
+    gainmaskfile.close()
+
+# ==========================================================
+# ==========================================================
+# -------
+# LOGGING 
+# --------------------------
+logging.captureWarnings(True)
+
+# ---------------
+# PARSE ARGUMENTS
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+parser = argparse.ArgumentParser(prog='gainmap', description='A script generating a gain map based on fitting to pixelwise histograms from either fluorescence or sample data.')
+parser.add_argument('mode', action='store_true', help='fit or generate')
+subparsers = parser.add_subparsers() 
+
+fit_parser = subparsers.add_parser('fit', help='Fitting Gaussians to the histogram using Scipys leastq')
+fit_parser.add_argument('histfilename', metavar='FILE', type=str, help='A histogram file (as created by the cheetah histogram module)')
+fit_parser.add_argument('-m', metavar='FILE', type=str, help='A mask file in order to exclude bad pixels from the fitting')
+fit_parser.add_argument('-o', metavar='PATH', type=str, default='./', help='Path to the output directory')
+fit_parser.add_argument('-t', metavar='PATH', type=str, default='./', help='Path to the directory where things will be stored during runtime')
+fit_parser.add_argument('-c', metavar='INT', type=int, default=1, help='Nr. of CPUs to be used')
+fit_parser.set_defaults(func=fitting_mode)
+
+generate_parser = subparsers.add_parser('generate', help = 'Generate a gain map from fitting results')
+generate_parser.add_argument('fitfilename', metavar='FILE', type=str, help='A fitting file (as created by the pyGainmap fit module)')
+generate_parser.add_argument('-m', metavar='FILE', type=str, help='A mask file in order to exclude bad pixels for the gain map generation')
+generate_parser.add_argument('-o', metavar='PATH', type=str, default='./', help='Path to the output directory')
+generate_parser.add_argument('-s', action='store_true', help='Show histograms/maps for diagnostic reasons')
+generate_parser.add_argument('-b', type=int, default=100, help='Nr. of bins for showing histograms/maps for diagnostic reasons')
+generate_parser.add_argument('-ba', type=float, nargs=2, help='Minimal and Maximal allowed values for the amplitude of the background peak')
+generate_parser.add_argument('-bs', type=float, nargs=2, help='Minimal and Maximal allowed values for the offset of the background peak')
+generate_parser.add_argument('-pa', type=float, nargs=2, help='Minimal and Maximal allowed values for the amplitude of the photon peak')
+generate_parser.add_argument('-ps', type=float, nargs=2, help='Minimal and Maximal allowed values for the sigma of the photon peak')
+generate_parser.add_argument('-g', type=float, nargs=2, help='Minimal and Maximal allowed values for the gain')
+generate_parser.set_defaults(func=generating_mode)
+args = parser.parse_args()
+args.func(args)
+
