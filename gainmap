@@ -161,7 +161,7 @@ def generating_mode(args):
         show()
 
     # apply mask
-    gain[mask] = np.nan
+    gain[mask] = 1.
     bg_sigma[mask] = np.nan
 
     # ----------------------------

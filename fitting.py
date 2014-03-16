@@ -11,7 +11,7 @@ from scipy.optimize import leastsq
 ## TO SPEED UP A LITTLE BIT, CHANGE TO FUNCTIONS IMPORTED FROM CMODULES (THIS REQUIRES CYTHON INSTALLED AND: python setup.py build_ext --inplace)
 #from Cmodules import gaussian_model, errfunc 
 gaussian_model = lambda x,p: p[0] * np.exp( - (np.power(x-p[1],2)) / (2*np.power(p[2],2)) ) # the gaussian model
-errfunc = lambda p,x,y : (_gauss_model(x,p) - y) # the error metric  
+errfunc = lambda p,x,y : gaussian_model(x,p) - y # the error metric  
 
 class FitError(Exception):
     def __init__(self, value): self.parameter = value
@@ -53,7 +53,7 @@ def fit_photon_histograms(input):
             bghmask = np.ones(bins.shape[0]).astype(np.bool)
             bghmask[index_bg_peak + int(4*bgsigma_start):] = False
             bghmask[0] = False
-        
+            
             # use leastsq without bounds
             p, ier = leastsq(errfunc, p0, args=(bins[bghmask], hist[bghmask]), maxfev=20000)
             if ier > 4: raise FitError("scipy.optimize.leastsq did not converge")
